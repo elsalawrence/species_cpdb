@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "species-cpdb"
+version = "0.1.0"
+description = "Cross-species and single-species spatial cell-cell interaction inference, wrapping CellPhoneDB"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Elsa" }]
+keywords = [
+    "spatial-transcriptomics", "cell-cell-interaction", "ligand-receptor",
+    "cellphonedb", "cross-species", "xenograft", "orthology", "alphafold",
+    "visium", "xenium", "bioinformatics",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "anndata>=0.9",
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "matplotlib",
+    "cellphonedb>=5.0",
+]
+
+[project.optional-dependencies]
+orthology = ["requests"]
+spatial-graph = ["squidpy>=1.2"]  # optional; core uses scipy KDTree
+# structural filtering: PRODIGY (dG, CPU) + biopython. The folding backend
+# (localcolabfold / boltz) is installed separately per its own instructions and
+# needs a GPU for practical speed.
+structure = ["prodigy-prot", "biopython", "requests"]
+dev = ["pytest", "build", "twine"]
+
+[project.urls]
+# TODO(user): point these at your repository before publishing.
+Homepage = "https://github.com/elsalawrence/species_cpdb"
+Repository = "https://github.com/elsalawrence/species_cpdb"
+Issues = "https://github.com/elsalawrence/species_cpdb/issues"
+
+[project.scripts]
+species-cpdb = "species_cpdb.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+species_cpdb = ["data/*.csv", "data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
