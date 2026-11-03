@@ -160,7 +160,7 @@ the backend using your GPU like cell2location:
 from species_cpdb.structure import run_structural_filter, ColabFoldBackend
 kept, scores = run_structural_filter(
     hits,                                  # sequences fetched from UniProt automatically
-    out_dir="struct/", backend=ColabFoldBackend(), device="auto",   # "gpu"/"cpu" to force
+    out_dir="struct/", backend=ColabFoldBackend(), device="gpu",    # default; errors without a GPU
     min_iptm=0.5, max_interface_pae=15, max_delta_g=-6.0)           # your AF + affinity cutoffs
 ```
 
@@ -177,7 +177,14 @@ those by hand for complexes you care about.
 The folding backend (localcolabfold / Boltz) is an **opt-in** install needed
 *only* when you call this; PRODIGY (`pip install .[structure]`) is CPU and light.
 A `MockFoldingBackend` and `CommandFoldingBackend` (wire Boltz/Chai/AF3) are
-provided. `device="auto"` uses a GPU if present.
+provided.
+
+**GPU check.** `device="gpu"` is the default and is checked *before* anything is
+fetched or folded: if no NVIDIA GPU is visible (`nvidia-smi`), or ColabFold's
+JAX isn't the CUDA build, it stops with an error saying how to get one (e.g. a
+Colab GPU runtime) instead of silently folding on CPU for hours. Pass
+`device="cpu"` only if you really mean to fold on CPU. Apple-silicon Macs have no
+CUDA GPU, so fold on Colab / a cluster / a cloud GPU.
 
 *Or fold elsewhere and feed results in*:
 
