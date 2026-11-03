@@ -1,0 +1,23 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# generated data / outputs (keep the small seeds bundled under src/)
+data/cpdb/
+data/xspecies_db/
+data/xdb_*/
+data/run_*/
+data/orthologs_ensembl.csv
+examples/out/
+
+# local tooling
+.Rhistory
+.claude/settings.local.json

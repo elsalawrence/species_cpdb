@@ -1,0 +1,7 @@
+include README.md
+include LICENSE
+recursive-include src/species_cpdb/data *.csv *.json
+recursive-include tests *.py
+recursive-include examples *.py
+prune data
+prune examples/out
