@@ -428,3 +428,70 @@ def test_gpu_available_respects_hidden_devices(monkeypatch):
 
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     assert structure.gpu_available() is False
+
+
+_FAKE_COLABFOLD = '''#!{python}
+import json, os, sys, time
+fasta, out = sys.argv[-2], sys.argv[-1]
+if os.environ.get("FAKE_FAIL"):
+    print("ERROR: MSA server rate limit", file=sys.stderr)
+    sys.exit(3)
+os.makedirs(out, exist_ok=True)
+print("Query 1/1: test (length 4)", flush=True)
+for p in (0, 50, 100):
+    sys.stderr.write(f"\\rCOMPLETE: {{p}}%")
+    sys.stderr.flush()
+print("\\nalphafold2_multimer_v3_model_1 recycle=3 pLDDT=88 pTM=0.8 ipTM=0.77", flush=True)
+json.dump({{"iptm": 0.77, "ptm": 0.8, "pae": [[1, 9, 9], [9, 1, 9], [9, 9, 1]]}},
+          open(os.path.join(out, "x_scores_rank_001_model_1.json"), "w"))
+open(os.path.join(out, "x_unrelaxed_rank_001_model_1.pdb"), "w").write("END\\n")
+'''
+
+
+def _fake_colabfold(tmp_path):
+    import sys
+
+    exe = tmp_path / "bin" / "colabfold_batch"
+    exe.parent.mkdir()
+    exe.write_text(_FAKE_COLABFOLD.format(python=sys.executable))
+    exe.chmod(0o755)
+    return str(exe)
+
+
+def test_colabfold_streams_progress(tmp_path, capsys):
+    """ColabFold's log reaches the notebook/terminal live, plus per-fold progress lines."""
+    import pandas as pd
+    from species_cpdb import structure
+
+    backend = structure.ColabFoldBackend(executable=_fake_colabfold(tmp_path))
+    hits = pd.DataFrame({"interacting_pair": ["ssc:IL6_hsa:IL6R"], "cross_species": [True]})
+    _, scores = structure.run_structural_filter(
+        hits, {"ssc:IL6": "MA", "hsa:IL6R": "MBC"}, out_dir=str(tmp_path / "s"),
+        backend=backend, device="cpu", run_prodigy=False,
+        min_pdockq=None, max_interface_pae=None)
+    out = capsys.readouterr().out
+    assert "[1/1] folding ssc:IL6_hsa:IL6R -- 2 chains, 5 aa" in out
+    assert "COMPLETE: 100%" in out and "ipTM=0.77" in out       # ColabFold's own log
+    assert "[1/1] done in" in out and "folded 1/1" in out
+    assert scores.iptm.iloc[0] == 0.77
+    logs = list((tmp_path / "s").rglob("colabfold_output.log"))
+    assert logs and "Query 1/1" in logs[0].read_text()
+
+    # quiet mode: no echo, but the log file is still written
+    backend.verbose = False
+    structure.run_structural_filter(
+        hits, {"ssc:IL6": "MA", "hsa:IL6R": "MBC"}, out_dir=str(tmp_path / "q"),
+        backend=backend, device="cpu", run_prodigy=False, progress=False,
+        min_pdockq=None, max_interface_pae=None)
+    assert capsys.readouterr().out == ""
+    assert list((tmp_path / "q").rglob("colabfold_output.log"))
+
+
+def test_colabfold_failure_shows_tail(tmp_path, monkeypatch):
+    import pytest as _pt
+    from species_cpdb import structure
+
+    monkeypatch.setenv("FAKE_FAIL", "1")
+    backend = structure.ColabFoldBackend(executable=_fake_colabfold(tmp_path), verbose=False)
+    with _pt.raises(RuntimeError, match="(?s)exited with code 3.*MSA server rate limit"):
+        backend.fold("a_b", [("a", "MA"), ("b", "MB")], str(tmp_path / "f"), device="cpu")

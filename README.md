@@ -186,6 +186,24 @@ Colab GPU runtime) instead of silently folding on CPU for hours. Pass
 `device="cpu"` only if you really mean to fold on CPU. Apple-silicon Macs have no
 CUDA GPU, so fold on Colab / a cluster / a cloud GPU.
 
+**Progress.** Folding is slow (minutes to well over ten per complex on a free
+Colab T4, mostly queueing at the public MSA server), so you can see it working:
+each complex prints a start line (`[2/5] folding ... -- 3 chains, 1012 aa`) and a
+finish line (time taken, ipTM, interface PAE, ΔG), and ColabFold's own log (MSA
+queue, model progress, per-model pLDDT/ipTM) streams live into the notebook cell.
+The log is also saved as `colabfold_output.log` in each fold's folder, and if a
+fold fails its last lines are shown in the error. Turn the lines off with
+`progress=False` and the live log with `ColabFoldBackend(verbose=False)`.
+
+**On Google Colab**, install with Colab's own pandas pinned. The newest
+`anndata`/`scanpy` need pandas ≥ 2.3, which would otherwise replace the pandas
+Colab ships with and break the `google-colab` package:
+
+```python
+!pip install -q "colabfold[alphafold-minus-jax] @ git+https://github.com/sokrypton/ColabFold"
+!pip install -q "species_cpdb[structure]" "pandas==$(python -c 'import pandas; print(pandas.__version__)')"
+```
+
 *Or fold elsewhere and feed results in*:
 
 ```python

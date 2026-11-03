@@ -37,7 +37,10 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import time
 import warnings
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -321,6 +324,52 @@ def _write_multimer_fasta(name: str, chains: list, out_dir: str, colabfold_style
     return path
 
 
+def _run_streaming(cmd, env=None, log_path: str | None = None, verbose: bool = True,
+                   tail_lines: int = 30) -> None:
+    """Run ``cmd``, echoing its output live to ``sys.stdout`` (and ``log_path``).
+
+    Output goes through Python's ``sys.stdout`` rather than the raw file
+    descriptor, so it shows up in Jupyter / Colab cells, not just a terminal.
+    Read in raw chunks, not lines, so progress bars that redraw with ``\\r``
+    (ColabFold's MSA/model tqdm bars) update as they go. On a non-zero exit the
+    last ``tail_lines`` lines are put in the error, so failures are readable
+    even with ``verbose=False``.
+    """
+    import codecs
+
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    tail, partial = deque(maxlen=tail_lines), ""
+    log = open(log_path, "a") if log_path else None
+    try:
+        while True:
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            text = decoder.decode(chunk)
+            if verbose:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            if log:
+                log.write(text)
+                log.flush()
+            *done, partial = (partial + text).replace("\r", "\n").split("\n")
+            tail.extend(line for line in done if line.strip())
+        proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close()
+        if log:
+            log.close()
+    if partial.strip():
+        tail.append(partial)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"{os.path.basename(str(cmd[0]))} exited with code {proc.returncode}. Last output:\n"
+            + "\n".join(tail))
+
+
 def _interface_pae_from_matrix(pae, chain_lengths) -> float:
     """Mean PAE over inter-chain residue blocks (the interface)."""
     import numpy as np
@@ -345,18 +394,23 @@ class ColabFoldBackend(FoldingBackend):
     Install separately (localcolabfold); GPU strongly recommended but CPU works.
     Best-effort output parsing (ColabFold versions vary) -- adjust ``scores_glob``/
     ``model_glob`` if your version names files differently.
+
+    ``verbose=True`` (default) streams ColabFold's own log -- MSA server queue,
+    model progress, per-model pLDDT/ipTM -- into the notebook cell or terminal as
+    it runs. It is always also written to ``<fold dir>/colabfold_output.log``.
     """
 
     name = "colabfold"
 
     def __init__(self, executable: str = "colabfold_batch", num_models: int = 1,
                  extra_args: tuple = (), scores_glob: str = "*scores_rank_001*.json",
-                 model_glob: str = "*rank_001*.pdb"):
+                 model_glob: str = "*rank_001*.pdb", verbose: bool = True):
         self.executable = executable
         self.num_models = num_models
         self.extra_args = list(extra_args)
         self.scores_glob = scores_glob
         self.model_glob = model_glob
+        self.verbose = verbose
 
     def _jax_backend(self) -> str | None:
         """JAX's platform as seen by ColabFold's own Python ('gpu'/'cpu'), if findable."""
@@ -422,7 +476,9 @@ class ColabFoldBackend(FoldingBackend):
         sub = os.path.join(out_dir, "colabfold_" + os.path.splitext(os.path.basename(fasta))[0])
         env = self._env(device)
         cmd = [self.executable, "--num-models", str(self.num_models), *self.extra_args, fasta, sub]
-        subprocess.run(cmd, check=True, env=env)
+        os.makedirs(sub, exist_ok=True)
+        _run_streaming(cmd, env=env, log_path=os.path.join(sub, "colabfold_output.log"),
+                       verbose=self.verbose)
 
         res = FoldResult(interacting_pair=name)
         scores = sorted(glob.glob(os.path.join(sub, self.scores_glob)))
@@ -443,20 +499,22 @@ class CommandFoldingBackend(FoldingBackend):
 
     ``command(fasta, out_dir, device) -> list[str]`` and
     ``parse(out_dir, chains) -> FoldResult``. Lets you wire Boltz, Chai, AF3, etc.
-    without changing the tool.
+    without changing the tool. ``verbose`` streams the tool's output live, as for
+    :class:`ColabFoldBackend`.
     """
 
     name = "command"
 
-    def __init__(self, command, parse, colabfold_style_fasta: bool = False):
+    def __init__(self, command, parse, colabfold_style_fasta: bool = False, verbose: bool = True):
         self._command = command
         self._parse = parse
         self.colabfold_style = colabfold_style_fasta
+        self.verbose = verbose
 
     def fold(self, name, chains, out_dir, device="gpu"):
         os.makedirs(out_dir, exist_ok=True)
         fasta = _write_multimer_fasta(name, chains, out_dir, self.colabfold_style)
-        subprocess.run(self._command(fasta, out_dir, device), check=True)
+        _run_streaming(self._command(fasta, out_dir, device), verbose=self.verbose)
         r = self._parse(out_dir, chains)
         r.interacting_pair = name
         return r
@@ -489,6 +547,14 @@ def predict_affinity_prodigy(pdb_path: str, temperature: float = 25.0,
     raise RuntimeError("could not parse PRODIGY output")
 
 
+def _fmt(x, nd: int = 2) -> str:
+    return "n/a" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.{nd}f}"
+
+
+def _fmt_minutes(seconds: float) -> str:
+    return f"{seconds:.0f} s" if seconds < 90 else f"{seconds / 60:.1f} min"
+
+
 def run_structural_filter(
     hits: pd.DataFrame,
     sequences: dict | None = None,
@@ -506,6 +572,7 @@ def run_structural_filter(
     min_pdockq: float | None = DEFAULT_THRESHOLDS["min_pdockq"],
     max_delta_g: float | None = DEFAULT_THRESHOLDS["max_delta_g"],
     keep_unscored: bool = False,
+    progress: bool = True,
 ):
     """Fold each shortlisted complex, (optionally) run PRODIGY, apply your cutoffs.
 
@@ -524,6 +591,12 @@ def run_structural_filter(
     anything and raises ``RuntimeError`` if there isn't one; ``device="cpu"``
     folds on CPU deliberately (very slow).
 
+    ``progress=True`` (default) prints a line as each complex starts and finishes
+    (``[2/5] folding ... -- 3 chains, 1012 aa``, then elapsed time and ipTM/dG);
+    the backend's own live log is controlled by its ``verbose`` flag. A single fold
+    on a free Colab T4 takes from a few minutes to well over ten, mostly waiting
+    for the public MSA server.
+
     Returns ``(filtered_hits, scores)`` -- ``scores`` is the per-interaction metric
     table (also usable later with :func:`filter_hits_structurally`).
     """
@@ -532,15 +605,23 @@ def run_structural_filter(
     os.makedirs(out_dir, exist_ok=True)
     df = hits[hits["cross_species"]] if (cross_only and "cross_species" in hits.columns) else hits
     partners = _partners_by_pair(df, key)
+    say = (lambda msg: print(msg, flush=True)) if progress else (lambda msg: None)
+    if sequences is None:
+        say(f"fetching sequences for {len(partners)} complex(es) from UniProt (cached) ...")
     sequences = _resolve_sequences(partners, sequences, sequence_cache_dir)
-    rows = []
-    for pair, (lig, rec) in partners.items():
+    say(f"folding {len(partners)} complex(es) with {backend.name} on {device}")
+    rows, t_all = [], time.time()
+    for i, (pair, (lig, rec)) in enumerate(partners.items(), 1):
         genes = list(lig) + list(rec)
         missing = [g for g in genes if g not in sequences]
         if missing:
             warnings.warn(f"skipping {pair}: no sequence for {missing}")
+            say(f"[{i}/{len(partners)}] skipped {pair}: no sequence for {', '.join(missing)}")
             continue
         chains = [(g, sequences[g]) for g in genes]
+        say(f"[{i}/{len(partners)}] folding {pair} -- {len(chains)} chains, "
+            f"{sum(len(s) for _, s in chains)} aa")
+        t0 = time.time()
         fr = backend.fold(pair, chains, out_dir=os.path.join(out_dir, "folds"), device=device)
         row = {key: pair, "iptm": fr.iptm, "ptm": fr.ptm,
                "interface_pae": fr.interface_pae, "pdockq": fr.pdockq, "bsa": None, "delta_g": None}
@@ -550,6 +631,10 @@ def run_structural_filter(
             except Exception as e:  # noqa: BLE001
                 warnings.warn(f"PRODIGY failed for {pair}: {e}")
         rows.append(row)
+        say(f"[{i}/{len(partners)}] done in {_fmt_minutes(time.time() - t0)}: "
+            f"ipTM={_fmt(row['iptm'])} interface_PAE={_fmt(row['interface_pae'], 1)} "
+            f"dG={_fmt(row['delta_g'], 1)}")
+    say(f"folded {len(rows)}/{len(partners)} complex(es) in {_fmt_minutes(time.time() - t_all)}")
 
     scores = pd.DataFrame(rows, columns=[key, "iptm", "ptm", "interface_pae", "pdockq", "bsa", "delta_g"])
     filtered = filter_hits_structurally(
