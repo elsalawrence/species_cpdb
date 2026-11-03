@@ -24,7 +24,8 @@ Two ways to get the ``scores``:
 * let the tool run it -- :func:`run_structural_filter` folds each shortlisted
   complex through a pluggable backend (ColabFold / Boltz), optionally runs PRODIGY
   for dG, and applies your cutoffs, in one call. Like cell2location, the backend
-  uses your GPU if available (``device="auto"|"gpu"|"cpu"``) and is an *opt-in*
+  runs on your GPU (``device="gpu"``, the default -- it refuses to start without
+  one; ``device="cpu"`` to opt into slow CPU folding) and is an *opt-in*
   dependency -- only needed when you call this function.
 * or produce them yourself and pass ``scores`` to :func:`filter_hits_structurally`.
   :func:`write_fold_inputs` writes the ready-to-fold multimer FASTAs.
@@ -238,18 +239,48 @@ class FoldResult:
     extra: dict = field(default_factory=dict)
 
 
+DEVICES = ("gpu", "cpu")
+
+_NO_GPU_HELP = (
+    "On a Mac or a CPU-only machine, run the structural filter on a GPU runtime "
+    "(Google Colab: Runtime > Change runtime type > GPU; or a cluster / cloud GPU). "
+    "To fold on CPU anyway (very slow), pass device='cpu'."
+)
+
+
+def gpu_available() -> bool:
+    """True if an NVIDIA GPU is visible to this process (``nvidia-smi -L``)."""
+    if os.environ.get("CUDA_VISIBLE_DEVICES") in ("", "-1"):
+        return False
+    smi = shutil.which("nvidia-smi")
+    if smi is None:
+        return False
+    try:
+        out = subprocess.run([smi, "-L"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0 and "GPU" in out.stdout
+
+
 class FoldingBackend:
     """Interface for a structure-prediction backend.
 
     ``fold`` takes named chains ``[(chain_id, sequence), ...]`` (the ligand and
     receptor subunits of one cross-species complex) and returns a
-    :class:`FoldResult`. ``device`` is ``'auto' | 'gpu' | 'cpu'`` and behaves like
-    cell2location's accelerator arg -- the backend uses a GPU if available.
+    :class:`FoldResult`. ``device`` is ``'gpu'`` or ``'cpu'``, like cell2location's
+    accelerator arg; :meth:`check_device` runs once before any folding and raises
+    if a GPU was requested but isn't there.
     """
 
     name = "base"
 
-    def fold(self, name: str, chains: list, out_dir: str, device: str = "auto") -> FoldResult:
+    def check_device(self, device: str) -> None:
+        if device not in DEVICES:
+            raise ValueError(f"device must be one of {DEVICES}, got {device!r}")
+        if device == "gpu" and not gpu_available():
+            raise RuntimeError(f"device='gpu' but no NVIDIA GPU was found. {_NO_GPU_HELP}")
+
+    def fold(self, name: str, chains: list, out_dir: str, device: str = "gpu") -> FoldResult:
         raise NotImplementedError
 
 
@@ -262,11 +293,15 @@ class MockFoldingBackend(FoldingBackend):
 
     name = "mock"
 
+    def check_device(self, device):  # canned scores: runs anywhere
+        if device not in DEVICES:
+            raise ValueError(f"device must be one of {DEVICES}, got {device!r}")
+
     def __init__(self, scores_by_pair: dict | None = None, default: dict | None = None):
         self.scores_by_pair = scores_by_pair or {}
         self.default = default or {"iptm": 0.7, "ptm": 0.75, "interface_pae": 8.0, "pdockq": 0.4}
 
-    def fold(self, name, chains, out_dir, device="auto"):
+    def fold(self, name, chains, out_dir, device="gpu"):
         s = dict(self.default)
         s.update(self.scores_by_pair.get(name, {}))
         return FoldResult(interacting_pair=name, model_path=None, **{
@@ -323,7 +358,61 @@ class ColabFoldBackend(FoldingBackend):
         self.scores_glob = scores_glob
         self.model_glob = model_glob
 
-    def fold(self, name, chains, out_dir, device="auto"):
+    def _jax_backend(self) -> str | None:
+        """JAX's platform as seen by ColabFold's own Python ('gpu'/'cpu'), if findable."""
+        exe = shutil.which(self.executable)
+        if not exe:
+            return None
+        # the console script's shebang names the exact interpreter ColabFold runs in
+        candidates = []
+        try:
+            with open(exe, "rb") as fh:
+                first = fh.readline().decode(errors="ignore").strip()
+            if first.startswith("#!") and "python" in first:
+                candidates.append(first[2:].split()[0])
+        except OSError:
+            pass
+        bindir = os.path.dirname(os.path.realpath(exe))
+        candidates += [os.path.join(bindir, py) for py in ("python", "python3")]
+        for cand in candidates:
+            if os.path.exists(cand):
+                try:
+                    out = subprocess.run([cand, "-c", "import jax; print(jax.default_backend())"],
+                                         capture_output=True, text=True, timeout=300,
+                                         env=self._env("gpu"))
+                except (OSError, subprocess.SubprocessError):
+                    return None
+                return out.stdout.strip().splitlines()[-1] if out.returncode == 0 and out.stdout.strip() else None
+        return None
+
+    @staticmethod
+    def _env(device):
+        env = dict(os.environ)
+        if device == "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = ""
+            env["JAX_PLATFORM_NAME"] = "cpu"
+        else:
+            # don't let a stray CPU pin from the parent environment win
+            for k in ("JAX_PLATFORM_NAME", "JAX_PLATFORMS"):
+                if env.get(k) == "cpu":
+                    env.pop(k)
+        return env
+
+    def check_device(self, device):
+        if shutil.which(self.executable) is None:
+            raise RuntimeError(
+                f"{self.executable!r} not found. Install ColabFold (pip on Colab, or "
+                "localcolabfold), or use a different backend / precomputed scores.")
+        super().check_device(device)
+        if device == "gpu":
+            # a GPU on the machine isn't enough: ColabFold's JAX must be the CUDA build
+            backend = self._jax_backend()
+            if backend is not None and backend != "gpu":
+                raise RuntimeError(
+                    f"A GPU is present but ColabFold's JAX runs on {backend!r} -- install the "
+                    f"CUDA build of jax in ColabFold's environment. {_NO_GPU_HELP}")
+
+    def fold(self, name, chains, out_dir, device="gpu"):
         if shutil.which(self.executable) is None:
             raise RuntimeError(
                 f"{self.executable!r} not found. Install localcolabfold, or use a "
@@ -331,10 +420,7 @@ class ColabFoldBackend(FoldingBackend):
         os.makedirs(out_dir, exist_ok=True)
         fasta = _write_multimer_fasta(name, chains, out_dir, colabfold_style=True)
         sub = os.path.join(out_dir, "colabfold_" + os.path.splitext(os.path.basename(fasta))[0])
-        env = dict(os.environ)
-        if device == "cpu":
-            env["CUDA_VISIBLE_DEVICES"] = ""
-            env["JAX_PLATFORM_NAME"] = "cpu"
+        env = self._env(device)
         cmd = [self.executable, "--num-models", str(self.num_models), *self.extra_args, fasta, sub]
         subprocess.run(cmd, check=True, env=env)
 
@@ -367,7 +453,7 @@ class CommandFoldingBackend(FoldingBackend):
         self._parse = parse
         self.colabfold_style = colabfold_style_fasta
 
-    def fold(self, name, chains, out_dir, device="auto"):
+    def fold(self, name, chains, out_dir, device="gpu"):
         os.makedirs(out_dir, exist_ok=True)
         fasta = _write_multimer_fasta(name, chains, out_dir, self.colabfold_style)
         subprocess.run(self._command(fasta, out_dir, device), check=True)
@@ -410,7 +496,7 @@ def run_structural_filter(
     backend: FoldingBackend | None = None,
     *,
     sequence_cache_dir: str | None = None,
-    device: str = "auto",
+    device: str = "gpu",
     run_prodigy: bool = True,
     prodigy_temperature: float = 25.0,
     key: str = "interacting_pair",
@@ -425,7 +511,7 @@ def run_structural_filter(
 
     This is the "the tool runs AlphaFold" entry point. For every unique
     cross-species interaction it builds the multimer, folds it via ``backend``
-    (using your GPU when ``device`` allows), reads ipTM / interface-PAE / pDockQ,
+    (on the GPU unless ``device="cpu"``), reads ipTM / interface-PAE / pDockQ,
     optionally estimates dG with PRODIGY from the model, then filters on your
     thresholds. Fold only the shortlist you pass in.
 
@@ -434,11 +520,16 @@ def run_structural_filter(
     ``sequence_cache_dir`` (``~/.cache/species_cpdb``). ``backend`` defaults to
     :class:`ColabFoldBackend`.
 
+    ``device="gpu"`` (default) checks for a GPU *before* fetching or folding
+    anything and raises ``RuntimeError`` if there isn't one; ``device="cpu"``
+    folds on CPU deliberately (very slow).
+
     Returns ``(filtered_hits, scores)`` -- ``scores`` is the per-interaction metric
     table (also usable later with :func:`filter_hits_structurally`).
     """
-    os.makedirs(out_dir, exist_ok=True)
     backend = backend or ColabFoldBackend()
+    backend.check_device(device)
+    os.makedirs(out_dir, exist_ok=True)
     df = hits[hits["cross_species"]] if (cross_only and "cross_species" in hits.columns) else hits
     partners = _partners_by_pair(df, key)
     sequences = _resolve_sequences(partners, sequences, sequence_cache_dir)

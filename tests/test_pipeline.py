@@ -391,3 +391,40 @@ def test_run_structural_filter_autofetch(tmp_path):
         hits, out_dir=str(tmp_path / "sf"), backend=backend, sequence_cache_dir=str(tmp_path / "cache"),
         run_prodigy=False, min_pdockq=None, max_interface_pae=None)
     assert len(scores) == 1 and len(filtered) == 1
+
+
+def test_gpu_check_refuses_without_gpu(tmp_path, monkeypatch):
+    """device='gpu' fails fast (before fetching/folding) when no GPU is visible."""
+    import pandas as pd
+    import pytest as _pt
+    from species_cpdb import structure
+
+    calls = []
+
+    class Recording(structure.FoldingBackend):  # real (non-mock) device semantics
+        def fold(self, name, chains, out_dir, device="gpu"):
+            calls.append(device)
+            return structure.FoldResult(interacting_pair=name, iptm=0.9)
+
+    hits = pd.DataFrame({"interacting_pair": ["ssc:IL6_hsa:IL6R"], "cross_species": [True]})
+    seqs = {"ssc:IL6": "MA", "hsa:IL6R": "MB"}
+    kw = dict(out_dir=str(tmp_path), backend=Recording(), run_prodigy=False,
+              min_pdockq=None, max_interface_pae=None)
+
+    monkeypatch.setattr(structure, "gpu_available", lambda: False)
+    with _pt.raises(RuntimeError, match="no NVIDIA GPU"):
+        structure.run_structural_filter(hits, seqs, **kw)            # default device='gpu'
+    assert calls == []                                               # nothing folded
+    with _pt.raises(ValueError):
+        structure.run_structural_filter(hits, seqs, device="auto", **kw)
+    structure.run_structural_filter(hits, seqs, device="cpu", **kw)  # explicit CPU opt-in
+    monkeypatch.setattr(structure, "gpu_available", lambda: True)
+    structure.run_structural_filter(hits, seqs, **kw)
+    assert calls == ["cpu", "gpu"]
+
+
+def test_gpu_available_respects_hidden_devices(monkeypatch):
+    from species_cpdb import structure
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    assert structure.gpu_available() is False
