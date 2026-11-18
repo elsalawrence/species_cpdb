@@ -398,15 +398,25 @@ class ColabFoldBackend(FoldingBackend):
     ``verbose=True`` (default) streams ColabFold's own log -- MSA server queue,
     model progress, per-model pLDDT/ipTM -- into the notebook cell or terminal as
     it runs. It is always also written to ``<fold dir>/colabfold_output.log``.
+
+    ``num_recycle=3`` (default) is AlphaFold's standard number of refinement
+    passes. ColabFold's own multimer default is up to 20, stopping early only
+    once the structure settles -- which floppy regions (e.g. a full-length
+    receptor's transmembrane/intracellular tail) prevent, so each fold took ~30
+    min on a Colab T4 for an ipTM within ~0.01 of recycle 3 (IL6+IL6R: 0.81 at
+    recycle 3, 0.82 at 19). Raise it, or ``None`` for ColabFold's default, if you
+    want the extra refinement.
     """
 
     name = "colabfold"
 
     def __init__(self, executable: str = "colabfold_batch", num_models: int = 1,
                  extra_args: tuple = (), scores_glob: str = "*scores_rank_001*.json",
-                 model_glob: str = "*rank_001*.pdb", verbose: bool = True):
+                 model_glob: str = "*rank_001*.pdb", verbose: bool = True,
+                 num_recycle: int | None = 3):
         self.executable = executable
         self.num_models = num_models
+        self.num_recycle = num_recycle
         self.extra_args = list(extra_args)
         self.scores_glob = scores_glob
         self.model_glob = model_glob
@@ -475,7 +485,10 @@ class ColabFoldBackend(FoldingBackend):
         fasta = _write_multimer_fasta(name, chains, out_dir, colabfold_style=True)
         sub = os.path.join(out_dir, "colabfold_" + os.path.splitext(os.path.basename(fasta))[0])
         env = self._env(device)
-        cmd = [self.executable, "--num-models", str(self.num_models), *self.extra_args, fasta, sub]
+        cmd = [self.executable, "--num-models", str(self.num_models)]
+        if self.num_recycle is not None:
+            cmd += ["--num-recycle", str(self.num_recycle)]
+        cmd += [*self.extra_args, fasta, sub]
         os.makedirs(sub, exist_ok=True)
         _run_streaming(cmd, env=env, log_path=os.path.join(sub, "colabfold_output.log"),
                        verbose=self.verbose)

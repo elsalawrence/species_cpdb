@@ -195,6 +195,12 @@ The log is also saved as `colabfold_output.log` in each fold's folder, and if a
 fold fails its last lines are shown in the error. Turn the lines off with
 `progress=False` and the live log with `ColabFoldBackend(verbose=False)`.
 
+**Recycles.** `ColabFoldBackend` runs 3 recycles (AlphaFold's standard) rather
+than ColabFold's multimer default of up to 20. On a Colab T4 the IL6+IL6R
+control reached ipTM 0.81 by recycle 3 and 0.82 after 19 — about 25 extra
+minutes for no real change. Use `ColabFoldBackend(num_recycle=...)` to change it
+(`None` = ColabFold's default).
+
 **On Google Colab**, install with Colab's own pandas pinned. The newest
 `anndata`/`scanpy` need pandas ≥ 2.3, which would otherwise replace the pandas
 Colab ships with and break the `google-colab` package:

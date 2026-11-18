@@ -437,6 +437,7 @@ if os.environ.get("FAKE_FAIL"):
     print("ERROR: MSA server rate limit", file=sys.stderr)
     sys.exit(3)
 os.makedirs(out, exist_ok=True)
+json.dump(sys.argv[1:], open(os.path.join(out, "argv.json"), "w"))
 print("Query 1/1: test (length 4)", flush=True)
 for p in (0, 50, 100):
     sys.stderr.write(f"\\rCOMPLETE: {{p}}%")
@@ -476,6 +477,9 @@ def test_colabfold_streams_progress(tmp_path, capsys):
     assert scores.iptm.iloc[0] == 0.77
     logs = list((tmp_path / "s").rglob("colabfold_output.log"))
     assert logs and "Query 1/1" in logs[0].read_text()
+    import json
+    argv = json.loads(next((tmp_path / "s").rglob("argv.json")).read_text())
+    assert argv[argv.index("--num-recycle") + 1] == "3"           # not ColabFold's 20
 
     # quiet mode: no echo, but the log file is still written
     backend.verbose = False
