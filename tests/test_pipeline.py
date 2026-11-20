@@ -443,8 +443,11 @@ for p in (0, 50, 100):
     sys.stderr.write(f"\\rCOMPLETE: {{p}}%")
     sys.stderr.flush()
 print("\\nalphafold2_multimer_v3_model_1 recycle=3 pLDDT=88 pTM=0.8 ipTM=0.77", flush=True)
-json.dump({{"iptm": 0.77, "ptm": 0.8, "pae": [[1, 9, 9], [9, 1, 9], [9, 9, 1]]}},
-          open(os.path.join(out, "x_scores_rank_001_model_1.json"), "w"))
+scores = {{"iptm": 0.77, "ptm": 0.8, "pae": [[1, 9, 9], [9, 1, 9], [9, 9, 1]]}}
+if not os.environ.get("FAKE_OLD_COLABFOLD"):   # ColabFold >= 1.6 writes these
+    scores.update(ipsae={{"A-B": 0.69, "B-A": 0.61}}, pdockq={{"A-B": 0.41}},
+                  pdockq2={{"A-B": 0.55, "B-A": 0.52}})
+json.dump(scores, open(os.path.join(out, "x_scores_rank_001_model_1.json"), "w"))
 open(os.path.join(out, "x_unrelaxed_rank_001_model_1.pdb"), "w").write("END\\n")
 '''
 
@@ -475,6 +478,8 @@ def test_colabfold_streams_progress(tmp_path, capsys):
     assert "COMPLETE: 100%" in out and "ipTM=0.77" in out       # ColabFold's own log
     assert "[1/1] done in" in out and "folded 1/1" in out
     assert scores.iptm.iloc[0] == 0.77
+    assert scores.ipsae.iloc[0] == 0.69 and scores.pdockq.iloc[0] == 0.41  # read, not recomputed
+    assert scores.pdockq2.iloc[0] == 0.55 and "ipSAE=0.69" in out
     logs = list((tmp_path / "s").rglob("colabfold_output.log"))
     assert logs and "Query 1/1" in logs[0].read_text()
     import json
@@ -499,3 +504,48 @@ def test_colabfold_failure_shows_tail(tmp_path, monkeypatch):
     backend = structure.ColabFoldBackend(executable=_fake_colabfold(tmp_path), verbose=False)
     with _pt.raises(RuntimeError, match="(?s)exited with code 3.*MSA server rate limit"):
         backend.fold("a_b", [("a", "MA"), ("b", "MB")], str(tmp_path / "f"), device="cpu")
+
+
+def test_ipsae_ignores_floppy_tail():
+    """ipSAE stays high when a disordered tail inflates the mean interface PAE."""
+    import numpy as np
+    from species_cpdb import structure
+
+    la, lb, tail = 40, 40, 60                   # receptor = 40 bound + 60 floppy residues
+    n = la + lb + tail
+    pae = np.full((n, n), 0.5)                  # confident, tightly packed interface
+    pae[:, la + lb:] = pae[la + lb:, :] = 28.0  # tail placed with no confidence
+    tight = structure._ipsae_from_matrix(pae[:la + lb, :la + lb], [la, lb])
+    floppy = structure._ipsae_from_matrix(pae, [la, lb + tail])
+    assert tight["A-B"] > 0.9 and abs(floppy["A-B"] - tight["A-B"]) < 1e-9
+    assert structure._interface_pae_from_matrix(pae, [la, lb + tail]) > 15  # PAE would reject it
+
+    # no confident cross-chain pairs at all -> 0
+    assert structure._ipsae_from_matrix(np.full((n, n), 28.0), [la, lb + tail])["A-B"] == 0.0
+
+
+def test_interface_max_uses_ligand_receptor_pairs_only():
+    from species_cpdb import structure
+
+    # chains: A = ligand, B/C = receptor subunits; B-C contact must not count
+    pairs = {"A-B": 0.3, "B-A": 0.5, "A-C": 0.2, "C-A": 0.1, "B-C": 0.95, "C-B": 0.9}
+    assert structure._interface_max(pairs, n_ligand=1, n_chains=3) == 0.5
+    assert structure._interface_max({}, 1, 2) is None
+
+
+def test_colabfold_ipsae_fallback_and_filter(tmp_path, monkeypatch):
+    """Older ColabFold (no ipsae in JSON): computed from PAE; min_ipsae filters on it."""
+    import pandas as pd
+    from species_cpdb import structure
+
+    monkeypatch.setenv("FAKE_OLD_COLABFOLD", "1")
+    backend = structure.ColabFoldBackend(executable=_fake_colabfold(tmp_path), verbose=False)
+    r = backend.fold("a_b", [("a", "MA"), ("b", "M")], str(tmp_path / "f"), device="cpu")
+    assert set(r.chain_pairs) == {"ipsae"} and r.pdockq is None
+    assert r.ipsae == structure._ipsae_from_matrix([[1, 9, 9], [9, 1, 9], [9, 9, 1]], [2, 1])["A-B"]
+
+    hits = pd.DataFrame({"interacting_pair": ["x_y", "u_v"]})
+    scores = pd.DataFrame({"interacting_pair": ["x_y", "u_v"], "ipsae": [0.7, 0.2]})
+    kept = structure.filter_hits_structurally(hits, scores, min_ipsae=0.5)
+    assert kept.interacting_pair.tolist() == ["x_y"]
+    assert len(structure.filter_hits_structurally(hits, scores)) == 2   # no default cutoff

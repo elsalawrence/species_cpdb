@@ -153,7 +153,7 @@ cell types are actually within `radius_contact`.
 filter on the shortlist, so you fold dozens of survivors, never the whole DB.
 Two ways:
 
-*The tool runs it for you* (fold → ipTM/PAE → PRODIGY ΔG → your cutoffs), with
+*The tool runs it for you* (fold → ipTM/ipSAE/PAE → PRODIGY ΔG → your cutoffs), with
 the backend using your GPU like cell2location:
 
 ```python
@@ -222,6 +222,29 @@ Note: AlphaFold predicts *structure* (ipTM/PAE), not affinity — PRODIGY/FoldX 
 the ΔG for `max_delta_g`. Complexes are folded subunit by subunit: celltype-engine
 hits name complexes (`hsa:TGFbeta_receptor1`), so their member genes are read from
 the `interactors` column (`ssc:TGFB1->hsa:TGFBR1+hsa:TGFBR2`).
+
+**The scores table** has one row per folded complex:
+
+| Column | What it measures | Filter (default) |
+|---|---|---|
+| `iptm` | AlphaFold's confidence in how the chains are placed relative to each other (0–1) | `min_iptm` (0.5) |
+| `ipsae` | Like ipTM, but counting only residue pairs AlphaFold placed confidently (0–1) | `min_ipsae` (off) |
+| `interface_pae` | Mean predicted error across *all* inter-chain residue pairs (Å, lower is better) | `max_interface_pae` (15) |
+| `pdockq`, `pdockq2` | Interface scores from contacts + pLDDT (0–1) | `min_pdockq` (0.23) |
+| `delta_g` | PRODIGY binding free energy from the model (kcal/mol, more negative is tighter) | `max_delta_g` (off) |
+| `ptm` | Whole-complex fold confidence (0–1) | — |
+
+ipSAE (Dunbrack 2025) is the one to watch for receptors folded at full length:
+their transmembrane and intracellular parts never touch the ligand and are placed
+with no confidence, which drags `interface_pae` (and to a lesser extent ipTM) down
+even for true binders, while ipSAE ignores them. In the IL6+IL6R control on Colab,
+ipTM was 0.81 and ipSAE 0.69, but interface PAE was 18.4 Å, which the default 15 Å
+cutoff would reject. There's no settled universal ipSAE cutoff, so it's reported
+but not filtered by default; pick `min_ipsae` from known binders and non-binders.
+ipSAE, pDockQ and pDockQ2 are read from ColabFold's output (≥ 1.6; ipSAE is
+computed from the PAE matrix for older versions or other backends) and taken over
+ligand↔receptor chain pairs only, so a heteromeric receptor's subunits touching
+each other don't count as binding.
 
 ## The idea in one picture
 

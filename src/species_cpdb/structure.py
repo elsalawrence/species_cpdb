@@ -50,15 +50,20 @@ import pandas as pd
 # interface PAE < ~10-15 A indicates a confident interface; pDockQ > 0.23 is the
 # widely used acceptable-model threshold. delta_g <= -6 kcal/mol ~ a real,
 # non-weak interaction (PRODIGY-scale). Tune per your validation.
+# ipSAE (Dunbrack 2025) scores only confidently-placed residue pairs, so unlike
+# ipTM / interface PAE it isn't dragged down by disordered or membrane-spanning
+# tails that sit far from the interface. It is always reported; there's no
+# settled universal cutoff yet, so set ``min_ipsae`` from your own controls.
 DEFAULT_THRESHOLDS = {
     "min_iptm": 0.50,
     "max_interface_pae": 15.0,
     "min_pdockq": 0.23,
+    "min_ipsae": None,      # e.g. calibrate on known binders / non-binders
     "min_bsa": None,        # optional; e.g. 400 A^2
     "max_delta_g": None,    # set e.g. -6.0 to require an affinity floor (needs PRODIGY/FoldX)
 }
 
-_SCORE_COLS = ["iptm", "ptm", "interface_pae", "pdockq", "bsa", "delta_g"]
+_SCORE_COLS = ["iptm", "ptm", "interface_pae", "ipsae", "pdockq", "pdockq2", "bsa", "delta_g"]
 
 
 def filter_hits_structurally(
@@ -70,6 +75,7 @@ def filter_hits_structurally(
     min_iptm: float | None = DEFAULT_THRESHOLDS["min_iptm"],
     max_interface_pae: float | None = DEFAULT_THRESHOLDS["max_interface_pae"],
     min_pdockq: float | None = DEFAULT_THRESHOLDS["min_pdockq"],
+    min_ipsae: float | None = DEFAULT_THRESHOLDS["min_ipsae"],
     min_bsa: float | None = DEFAULT_THRESHOLDS["min_bsa"],
     max_delta_g: float | None = DEFAULT_THRESHOLDS["max_delta_g"],
     keep_unscored: bool = False,
@@ -78,15 +84,15 @@ def filter_hits_structurally(
 
     Applies whichever thresholds are set *and* whose column is present in
     ``scores``. Interface-confidence cutoffs: ``min_iptm``, ``max_interface_pae``,
-    ``min_pdockq``, ``min_bsa``. Affinity cutoff: ``max_delta_g`` (keep complexes
-    at least this tight, e.g. ``-6.0``; requires a ``delta_g`` column you produced
-    with PRODIGY/FoldX on the folded model).
+    ``min_ipsae``, ``min_pdockq``, ``min_bsa``. Affinity cutoff: ``max_delta_g``
+    (keep complexes at least this tight, e.g. ``-6.0``; requires a ``delta_g``
+    column you produced with PRODIGY/FoldX on the folded model).
 
     Parameters
     ----------
     scores
         One row per interaction: column ``key`` plus any of
-        ``iptm, ptm, interface_pae, pdockq, bsa, delta_g``. Produce by folding the
+        ``iptm, ptm, interface_pae, ipsae, pdockq, pdockq2, bsa, delta_g``. Produce by folding the
         shortlisted complexes (see :func:`write_fold_inputs`).
     predictor
         On-the-fly folding hook -- **not implemented** (needs GPU + AF); raises.
@@ -117,6 +123,7 @@ def filter_hits_structurally(
     checks = [
         (min_iptm, "iptm", "ge"),
         (max_interface_pae, "interface_pae", "le"),
+        (min_ipsae, "ipsae", "ge"),
         (min_pdockq, "pdockq", "ge"),
         (min_bsa, "bsa", "ge"),
         (max_delta_g, "delta_g", "le"),
@@ -239,6 +246,12 @@ class FoldResult:
     ptm: float | None = None
     interface_pae: float | None = None
     pdockq: float | None = None
+    ipsae: float | None = None
+    pdockq2: float | None = None
+    # per chain-pair scores, e.g. {"ipsae": {"A-B": 0.69, "B-A": 0.61}} with
+    # chains lettered A, B, ... in input order; run_structural_filter keeps only
+    # the ligand<->receptor pairs from these.
+    chain_pairs: dict = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
 
 
@@ -302,13 +315,14 @@ class MockFoldingBackend(FoldingBackend):
 
     def __init__(self, scores_by_pair: dict | None = None, default: dict | None = None):
         self.scores_by_pair = scores_by_pair or {}
-        self.default = default or {"iptm": 0.7, "ptm": 0.75, "interface_pae": 8.0, "pdockq": 0.4}
+        self.default = default or {"iptm": 0.7, "ptm": 0.75, "interface_pae": 8.0,
+                                   "pdockq": 0.4, "ipsae": 0.6}
 
     def fold(self, name, chains, out_dir, device="gpu"):
         s = dict(self.default)
         s.update(self.scores_by_pair.get(name, {}))
         return FoldResult(interacting_pair=name, model_path=None, **{
-            k: s.get(k) for k in ("iptm", "ptm", "interface_pae", "pdockq")})
+            k: s.get(k) for k in ("iptm", "ptm", "interface_pae", "pdockq", "ipsae", "pdockq2")})
 
 
 def _write_multimer_fasta(name: str, chains: list, out_dir: str, colabfold_style: bool) -> str:
@@ -386,6 +400,46 @@ def _interface_pae_from_matrix(pae, chain_lengths) -> float:
             (i0, i1), (j0, j1) = bounds[a], bounds[b]
             vals.append(pae[i0:i1, j0:j1])
     return float(np.concatenate([v.ravel() for v in vals]).mean()) if vals else float("nan")
+
+
+_CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+
+def _ipsae_from_matrix(pae, chain_lengths, pae_cutoff: float = 15.0) -> dict:
+    """ipSAE per ordered chain pair (``{"A-B": ..., "B-A": ...}``) from a PAE matrix.
+
+    Dunbrack (2025) ipSAE, as ColabFold computes it: for each residue of chain 1,
+    a TM-score-like average over the chain-2 residues it is confidently aligned
+    with (PAE < ``pae_cutoff``), with d0 scaled to that count; the pair's score is
+    the best residue. Used when the backend's own output doesn't include ipSAE.
+    """
+    pae = np.asarray(pae, dtype=float)
+    asym = np.repeat(np.arange(len(chain_lengths)), chain_lengths)
+    out = {}
+    for c1 in range(len(chain_lengths)):
+        for c2 in range(len(chain_lengths)):
+            if c1 == c2:
+                continue
+            valid = np.outer(asym == c1, asym == c2) & (pae < pae_cutoff)
+            n0 = valid.sum(axis=1)
+            d0 = np.maximum(1.0, 1.24 * (np.maximum(26.0, n0) - 15.0) ** (1.0 / 3.0) - 1.8)
+            sums = (valid / (1.0 + (pae / d0[:, None]) ** 2)).sum(axis=1)
+            per_res = np.divide(sums, n0, out=np.zeros_like(sums), where=n0 > 0)
+            out[f"{_CHAIN_IDS[c1]}-{_CHAIN_IDS[c2]}"] = float(per_res.max())
+    return out
+
+
+def _interface_max(pair_scores: dict, n_ligand: int, n_chains: int) -> float | None:
+    """Best score over ligand-chain <-> receptor-chain pairs (either direction).
+
+    Chains are lettered in fold order (ligand subunits first), so receptor-receptor
+    pairs of a heteromeric receptor don't count towards the ligand interface.
+    """
+    vals = [pair_scores[k]
+            for i in range(n_ligand) for j in range(n_ligand, n_chains)
+            for k in (f"{_CHAIN_IDS[i]}-{_CHAIN_IDS[j]}", f"{_CHAIN_IDS[j]}-{_CHAIN_IDS[i]}")
+            if pair_scores.get(k) is not None]
+    return max(vals) if vals else None
 
 
 class ColabFoldBackend(FoldingBackend):
@@ -500,8 +554,18 @@ class ColabFoldBackend(FoldingBackend):
                 d = json.load(fh)
             res.iptm = d.get("iptm")
             res.ptm = d.get("ptm")
+            lengths = [len(s) for _, s in chains]
             if "pae" in d:
-                res.interface_pae = _interface_pae_from_matrix(d["pae"], [len(s) for _, s in chains])
+                res.interface_pae = _interface_pae_from_matrix(d["pae"], lengths)
+            # ColabFold >= 1.6 writes per chain-pair ipSAE / pDockQ / pDockQ2;
+            # older versions don't, so compute ipSAE from the PAE matrix instead
+            for k in ("ipsae", "pdockq", "pdockq2"):
+                if isinstance(d.get(k), dict) and d[k]:
+                    res.chain_pairs[k] = d[k]
+            if "ipsae" not in res.chain_pairs and "pae" in d:
+                res.chain_pairs["ipsae"] = _ipsae_from_matrix(d["pae"], lengths)
+            for k, pairs in res.chain_pairs.items():   # whole-complex best, all pairs
+                setattr(res, k, max(pairs.values()))
         models = sorted(glob.glob(os.path.join(sub, self.model_glob)))
         res.model_path = models[0] if models else None
         return res
@@ -583,6 +647,7 @@ def run_structural_filter(
     min_iptm: float | None = DEFAULT_THRESHOLDS["min_iptm"],
     max_interface_pae: float | None = DEFAULT_THRESHOLDS["max_interface_pae"],
     min_pdockq: float | None = DEFAULT_THRESHOLDS["min_pdockq"],
+    min_ipsae: float | None = DEFAULT_THRESHOLDS["min_ipsae"],
     max_delta_g: float | None = DEFAULT_THRESHOLDS["max_delta_g"],
     keep_unscored: bool = False,
     progress: bool = True,
@@ -605,10 +670,16 @@ def run_structural_filter(
     folds on CPU deliberately (very slow).
 
     ``progress=True`` (default) prints a line as each complex starts and finishes
-    (``[2/5] folding ... -- 3 chains, 1012 aa``, then elapsed time and ipTM/dG);
+    (``[2/5] folding ... -- 3 chains, 1012 aa``, then elapsed time, ipTM, ipSAE,
+    interface PAE and dG);
     the backend's own live log is controlled by its ``verbose`` flag. A single fold
     on a free Colab T4 takes from a few minutes to well over ten, mostly waiting
     for the public MSA server.
+
+    Interface scores that come per chain pair (ipSAE, pDockQ, pDockQ2) are taken
+    over ligand<->receptor chain pairs only -- the best of them -- so for a
+    heteromeric receptor the receptor subunits' contact with each other doesn't
+    count as the ligand binding.
 
     Returns ``(filtered_hits, scores)`` -- ``scores`` is the per-interaction metric
     table (also usable later with :func:`filter_hits_structurally`).
@@ -636,8 +707,11 @@ def run_structural_filter(
             f"{sum(len(s) for _, s in chains)} aa")
         t0 = time.time()
         fr = backend.fold(pair, chains, out_dir=os.path.join(out_dir, "folds"), device=device)
-        row = {key: pair, "iptm": fr.iptm, "ptm": fr.ptm,
-               "interface_pae": fr.interface_pae, "pdockq": fr.pdockq, "bsa": None, "delta_g": None}
+        row = {key: pair, "iptm": fr.iptm, "ptm": fr.ptm, "interface_pae": fr.interface_pae,
+               "ipsae": fr.ipsae, "pdockq": fr.pdockq, "pdockq2": fr.pdockq2,
+               "bsa": None, "delta_g": None}
+        for metric, pair_scores in fr.chain_pairs.items():
+            row[metric] = _interface_max(pair_scores, len(lig), len(chains))
         if run_prodigy and fr.model_path:
             try:
                 row["delta_g"] = predict_affinity_prodigy(fr.model_path, prodigy_temperature)
@@ -645,12 +719,14 @@ def run_structural_filter(
                 warnings.warn(f"PRODIGY failed for {pair}: {e}")
         rows.append(row)
         say(f"[{i}/{len(partners)}] done in {_fmt_minutes(time.time() - t0)}: "
-            f"ipTM={_fmt(row['iptm'])} interface_PAE={_fmt(row['interface_pae'], 1)} "
+            f"ipTM={_fmt(row['iptm'])} ipSAE={_fmt(row['ipsae'])} "
+            f"interface_PAE={_fmt(row['interface_pae'], 1)} "
             f"dG={_fmt(row['delta_g'], 1)}")
     say(f"folded {len(rows)}/{len(partners)} complex(es) in {_fmt_minutes(time.time() - t_all)}")
 
-    scores = pd.DataFrame(rows, columns=[key, "iptm", "ptm", "interface_pae", "pdockq", "bsa", "delta_g"])
+    scores = pd.DataFrame(rows, columns=[key, *_SCORE_COLS])
     filtered = filter_hits_structurally(
         hits, scores=scores, key=key, min_iptm=min_iptm, max_interface_pae=max_interface_pae,
-        min_pdockq=min_pdockq, max_delta_g=max_delta_g, keep_unscored=keep_unscored)
+        min_ipsae=min_ipsae, min_pdockq=min_pdockq, max_delta_g=max_delta_g,
+        keep_unscored=keep_unscored)
     return filtered, scores
